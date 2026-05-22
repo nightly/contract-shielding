@@ -1,0 +1,3 @@
+# Contract Shielding
+
+## Code organisation
