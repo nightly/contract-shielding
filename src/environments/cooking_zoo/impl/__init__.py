@@ -1,0 +1,1 @@
+"""CookingZoo environment implementation."""

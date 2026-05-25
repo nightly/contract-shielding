@@ -1,0 +1,232 @@
+from typing import Callable, List, Union
+
+import flatland.envs.malfunction_generators as mfg
+from flatland.core.effects_generator import EffectsGenerator
+from flatland.core.grid.grid_utils import IntVector2D
+from flatland.envs import malfunction_generators as mal_gen
+from flatland.envs.agent_utils import EnvAgent
+from flatland.envs.step_utils.states import TrainState
+from flatland.utils.cli_utils import resolve_type
+
+
+class MalfunctionEffectsGenerator(EffectsGenerator["RailEnv"]):
+
+    def __init__(self, malfunction_generator=None, **kwargs):
+        super().__init__()
+        if malfunction_generator is not None:
+            self.malfunction_generator = malfunction_generator
+        else:
+            if kwargs:
+                self.malfunction_generator = mal_gen.ParamMalfunctionGen.extract_malfunction_generator(kwargs, key="param_malfunction_gen")
+            else:
+                # TODO https://github.com/flatland-association/flatland-rl/issues/242 not generic!
+                self.malfunction_generator = mal_gen.NoMalfunctionGen()
+
+    def on_episode_step_start(self, env: "RailEnv", *args, **kwargs) -> "RailEnv":
+        for agent in env.agents:
+            agent.malfunction_handler.generate_malfunction(self.malfunction_generator, env.np_random)
+        return env
+
+    def __getstate__(self):
+        if isinstance(self.malfunction_generator, mfg.ParamMalfunctionGen):
+            return {
+                "cls": self.fullname,
+                "specs": {
+                    "kwargs": {
+                        "param_malfunction_gen": self.malfunction_generator.get_process_data()._asdict(),
+                        "malfunction_cached_random_state": self.malfunction_generator._cached_random_state,
+                        "malfunction_rand_idx": self.malfunction_generator._rand_idx,
+                    }
+                }
+            }
+        else:
+            return {
+                "cls": self.fullname,
+            }
+
+
+# TODO https://github.com/flatland-association/flatland-rl/issues/242 generalize serialization
+
+MalfunctionCondition = Callable[["EnvAgent", int], bool]
+
+
+def on_map_state_condition(env_agent: EnvAgent, elapsed_steps: int) -> bool:
+    return env_agent.state_machine.state.is_on_map_state()
+
+
+class ConditionalMalfunctionEffectsGenerator(EffectsGenerator["RailEnv"]):
+    def __init__(self,
+                 malfunction_rate: float = None,
+                 min_duration: float = None,
+                 max_duration: float = None,
+                 earliest_malfunction: int = None,
+                 max_num_malfunctions: int = None,
+                 condition: Union[MalfunctionCondition, str] = None,
+                 condition_pkg: str = None,
+                 condition_cls: str = None,
+                 ):
+        """
+        Generate agent malfunctions conditionally with conditional rate and duration.
+
+        Parameters
+        ----------
+        malfunction_rate : float
+            Poisson process with given rate.
+        min_duration : int
+            If malfunction, duration uniformly in [min_duration,max_duration].
+        max_duration : int
+            If malfunction, duration uniformly in [min_duration,max_duration].
+        earliest_malfunction : int
+            Defaults to `None`.
+        max_num_malfunctions : int
+            Defaults to `None`.
+        condition : MalfunctionCondition | str
+            Additional condition. Defaults to None.
+        condition_pkg : str
+            Additional condition to be created instead of instance via `condition`. Defaults to None.
+        condition_cls : str
+            Additional condition to be created instead of instance via `condition`. Defaults to None.
+        """
+        super().__init__()
+
+        self._malfunction_rate = float(malfunction_rate)
+        self._min_duration = int(min_duration)
+        self._max_duration = int(max_duration)
+
+        self._malfunction_generator = mal_gen.ParamMalfunctionGen(
+            mal_gen.MalfunctionParameters(malfunction_rate=self._malfunction_rate, min_duration=self._min_duration, max_duration=self._max_duration)
+        )
+        self._earliest_condition = int(earliest_malfunction) if earliest_malfunction is not None else None
+        self._max_num_malfunctions = int(max_num_malfunctions) if max_num_malfunctions is not None else None
+        self._num_malfunctions = 0
+        self._condition = resolve_type(condition, condition_pkg, condition_cls)
+        self._condition = self._condition
+
+    def on_episode_step_start(self, env: "RailEnv", *args, **kwargs) -> "RailEnv":
+        if self._earliest_condition is not None and env._elapsed_steps < self._earliest_condition:
+            return env
+        if self._max_num_malfunctions is not None and self._num_malfunctions >= self._max_num_malfunctions:
+            return env
+        for agent in env.agents:
+            if self._condition is None or self._condition(agent, env._elapsed_steps):
+                in_malfunction_before = agent.malfunction_handler.in_malfunction
+                agent.malfunction_handler.generate_malfunction(self._malfunction_generator, env.np_random)
+                in_malfunction_after = agent.malfunction_handler.in_malfunction
+                if in_malfunction_after and not in_malfunction_before:
+                    self._num_malfunctions += 1
+                    if self._max_num_malfunctions is not None and self._num_malfunctions >= self._max_num_malfunctions:
+                        return env
+        return env
+
+
+def make_multi_malfunction_condition(conditions: List[MalfunctionCondition]) -> MalfunctionCondition:
+    """
+    Disjunctively wrap multiple MalfunctionCondition into one.
+
+    Parameters
+    ----------
+    conditions : List[MalfunctionCondition]
+        list of disjunctive conditions
+
+    Returns
+    -------
+    MalfunctionCondition
+
+    """
+
+    def _condition(agent: "EnvAgent", elapsed_steps: int):
+        for c in conditions:
+            if c(agent, elapsed_steps):
+                return True
+        return False
+
+    return _condition
+
+
+def condition_stopped_intermediate_and_range(start_step_incl: int, end_step_excl: int) -> MalfunctionCondition:
+    """
+    Malfunction condition: stopped at an intermediate waypoint and in range of timesteps.
+
+
+    Parameters
+    ----------
+    start_step_incl : int
+        start step of positive range (incl.)
+    end_step_excl : int
+        end step of positive range (excl.)
+
+    Returns
+    -------
+    MalfunctionCondition
+
+    """
+
+    def _condition(agent: "EnvAgent", elapsed_steps: int):
+        return ((agent.position in {w.position for ws in agent.waypoints[1:-1] for w in ws})
+                and agent.state_machine.state == TrainState.STOPPED and elapsed_steps >= start_step_incl and elapsed_steps < end_step_excl)
+
+    return _condition
+
+
+def condition_stopped_cells_and_range(start_step_incl: int, end_step_excl: int, cells: List[IntVector2D]) -> MalfunctionCondition:
+    """
+    Malfunction condition: stopped on any given cell and during range of timesteps.
+
+
+    Parameters
+    ----------
+    start_step_incl : int
+        start step of positive range (incl.)
+    end_step_excl : int
+        end step of positive range (excl.)
+
+    Returns
+    -------
+    MalfunctionCondition
+
+    """
+
+    def _condition(agent: "EnvAgent", elapsed_steps: int):
+        return agent.position in cells and agent.state_machine.state == TrainState.STOPPED and elapsed_steps >= start_step_incl and elapsed_steps < end_step_excl
+
+    return _condition
+
+
+class IntermediateStopMalfunctionEffectsGenerator(ConditionalMalfunctionEffectsGenerator):
+    """
+    Departure malfunctions at (intermediate) stops: generate malfunction when stopped at an (intermediate) waypoint.
+    """
+
+    @staticmethod
+    def _condition(agent: "EnvAgent", *args, **kwargs):
+        if agent.state_machine.state != TrainState.STOPPED:
+            return False
+        stops = {(wp.position, wp.direction) for wps in agent.waypoints for wp in wps}
+        return agent.current_configuration in stops
+
+    def __init__(self,
+                 malfunction_rate: float = 0,
+                 min_duration: float = 0,
+                 max_duration: float = 0,
+                 earliest_malfunction: int = 0,
+                 ):
+        super().__init__(
+            malfunction_rate=malfunction_rate,
+            min_duration=min_duration,
+            max_duration=max_duration,
+            earliest_malfunction=earliest_malfunction,
+            condition=IntermediateStopMalfunctionEffectsGenerator._condition
+        )
+
+    def __getstate__(self):
+        return {
+            "cls": self.fullname,
+            "specs": {
+                "kwargs": dict(
+                    malfunction_rate=self._malfunction_rate,
+                    min_duration=self._min_duration,
+                    max_duration=self._max_duration,
+                    earliest_malfunction=self._earliest_condition,
+                )
+            }
+        }

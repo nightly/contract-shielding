@@ -1,0 +1,1 @@
+"""Pressure Plate environment implementation."""
