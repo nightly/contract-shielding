@@ -1,8 +1,102 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+
+@dataclass
+class VectorEpisodicCostTracker:
+    """Track completed per-agent episode costs across rollout boundaries.
+
+    Rollout fragments are retained internally and never treated as complete
+    episodes.  The most recent completed-episode estimate is retained for
+    agents that do not finish an episode in the current rollout.
+    """
+
+    num_envs: int
+    num_agents: int
+    gamma: float = 1.0
+    initial_returns: float | np.ndarray = 0.0
+    _running_returns: np.ndarray = field(init=False, repr=False)
+    _running_masses: np.ndarray = field(init=False, repr=False)
+    _discounts: np.ndarray = field(init=False, repr=False)
+    _last_returns: np.ndarray = field(init=False, repr=False)
+    _last_scales: np.ndarray = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.num_envs <= 0 or self.num_agents <= 0:
+            raise ValueError("num_envs and num_agents must be positive.")
+        if not 0.0 <= float(self.gamma) <= 1.0:
+            raise ValueError("gamma must be in [0, 1].")
+
+        shape = (int(self.num_envs), int(self.num_agents))
+        self._running_returns = np.zeros(shape, dtype=np.float32)
+        self._running_masses = np.zeros(shape, dtype=np.float32)
+        self._discounts = np.ones(shape, dtype=np.float32)
+        initial = np.asarray(self.initial_returns, dtype=np.float32)
+        self._last_returns = np.broadcast_to(initial, (self.num_agents,)).copy()
+        self._last_scales = np.ones((self.num_agents,), dtype=np.float32)
+
+    def add(
+        self,
+        costs: np.ndarray,
+        episode_dones: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Add a rollout and return estimates, scales, and completion counts."""
+
+        costs = np.asarray(costs, dtype=np.float32)
+        episode_dones = np.asarray(episode_dones, dtype=np.float32)
+        expected_tail = (self.num_envs, self.num_agents)
+        if costs.shape != episode_dones.shape:
+            raise ValueError("costs and episode_dones must have matching shapes.")
+        if costs.ndim != 3 or costs.shape[1:] != expected_tail:
+            raise ValueError("costs must have shape (steps, num_envs, num_agents).")
+
+        completed_returns: list[list[float]] = [[] for _ in range(self.num_agents)]
+        completed_masses: list[list[float]] = [[] for _ in range(self.num_agents)]
+
+        for step_costs, step_dones in zip(costs, episode_dones, strict=True):
+            self._running_returns += self._discounts * step_costs
+            self._running_masses += self._discounts
+            done_mask = step_dones.astype(bool)
+
+            for env_idx, agent_idx in np.argwhere(done_mask):
+                completed_returns[int(agent_idx)].append(
+                    float(self._running_returns[env_idx, agent_idx])
+                )
+                completed_masses[int(agent_idx)].append(
+                    float(self._running_masses[env_idx, agent_idx])
+                )
+
+            self._running_returns = np.where(done_mask, 0.0, self._running_returns)
+            self._running_masses = np.where(done_mask, 0.0, self._running_masses)
+            self._discounts = np.where(
+                done_mask,
+                1.0,
+                self._discounts * float(self.gamma),
+            ).astype(np.float32)
+
+        completion_counts = np.asarray(
+            [len(agent_returns) for agent_returns in completed_returns],
+            dtype=np.int32,
+        )
+        for agent_idx, agent_returns in enumerate(completed_returns):
+            if not agent_returns:
+                continue
+            self._last_returns[agent_idx] = float(np.mean(agent_returns))
+            self._last_scales[agent_idx] = 1.0 / max(
+                float(np.mean(completed_masses[agent_idx])),
+                1e-8,
+            )
+
+        return (
+            self._last_returns.copy(),
+            self._last_scales.copy(),
+            completion_counts,
+        )
 
 
 def episode_history_entry(
@@ -95,14 +189,8 @@ def discounted_cost_returns_and_scales_at_starts(
         raise ValueError("costs and episode_dones must have matching shapes.")
 
     _, num_envs, num_agents = costs.shape
-    returns_by_agent: list[list[float]] = [
-        []
-        for _ in range(num_agents)
-    ]
-    masses_by_agent: list[list[float]] = [
-        []
-        for _ in range(num_agents)
-    ]
+    returns_by_agent: list[list[float]] = [[] for _ in range(num_agents)]
+    masses_by_agent: list[list[float]] = [[] for _ in range(num_agents)]
 
     for env_idx in range(num_envs):
         running_returns = np.zeros(num_agents, dtype=np.float32)
@@ -120,8 +208,12 @@ def discounted_cost_returns_and_scales_at_starts(
             done_mask = step_dones.astype(bool)
             for agent_idx, done in enumerate(done_mask):
                 if done:
-                    returns_by_agent[agent_idx].append(float(running_returns[agent_idx]))
-                    masses_by_agent[agent_idx].append(float(discounted_masses[agent_idx]))
+                    returns_by_agent[agent_idx].append(
+                        float(running_returns[agent_idx])
+                    )
+                    masses_by_agent[agent_idx].append(
+                        float(discounted_masses[agent_idx])
+                    )
                     running_returns[agent_idx] = 0.0
                     discounted_masses[agent_idx] = 0.0
                     discounts[agent_idx] = 1.0
@@ -142,9 +234,7 @@ def discounted_cost_returns_and_scales_at_starts(
     )
     scales = np.asarray(
         [
-            1.0 / max(float(np.mean(agent_masses)), 1e-8)
-            if agent_masses
-            else 1.0
+            1.0 / max(float(np.mean(agent_masses)), 1e-8) if agent_masses else 1.0
             for agent_masses in masses_by_agent
         ],
         dtype=np.float32,

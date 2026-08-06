@@ -13,6 +13,7 @@ from flax.linen.initializers import constant, orthogonal
 from jax.flatten_util import ravel_pytree
 
 from .trajectory import (
+    VectorEpisodicCostTracker,
     clipped_value_loss,
     compute_gae,
     discounted_cost_returns_and_scales_at_starts,
@@ -194,7 +195,10 @@ def make_train(
     config.setdefault("COST_LIMIT", 0.0)
     config.setdefault("COST_GAMMA", config["GAMMA"])
     config.setdefault("COST_GAE_LAMBDA", 0.5)
+    config.setdefault("COST_BUDGET_GAMMA", 1.0)
     config.setdefault("COST_VF_COEF", config["VF_COEF"])
+    config.setdefault("CENTER_COST_ADVANTAGES", True)
+    config.setdefault("NORMALIZE_COST_ADVANTAGES", False)
     config.setdefault("COST_INFO_KEY", "safety_violation")
     config.setdefault("COST_SHAPING_ENABLED", True)
     config.setdefault("COST_SHAPING_HORIZON", 20)
@@ -214,10 +218,14 @@ def make_train(
     config.setdefault("LINE_SEARCH_BACKTRACK_COEFF", 0.8)
     config.setdefault("ICPO_HIDDEN_SIZES", (64, 32))
     config["NUM_UPDATES"] = (
-        int(config["TOTAL_TIMESTEPS"]) // int(config["NUM_STEPS"]) // int(config["NUM_ENVS"])
+        int(config["TOTAL_TIMESTEPS"])
+        // int(config["NUM_STEPS"])
+        // int(config["NUM_ENVS"])
     )
     config["MINIBATCH_SIZE"] = (
-        int(config["NUM_STEPS"]) * int(config["NUM_ENVS"]) // int(config["NUM_MINIBATCHES"])
+        int(config["NUM_STEPS"])
+        * int(config["NUM_ENVS"])
+        // int(config["NUM_MINIBATCHES"])
     )
 
     factory_ref = env_factory or config.get("ENV_FACTORY") or config.get("ENV_NAME")
@@ -251,8 +259,12 @@ def make_train(
     )
 
     def linear_schedule(step_count: jax.Array) -> jax.Array:
-        minibatches_per_update = int(config["NUM_MINIBATCHES"]) * int(config["UPDATE_EPOCHS"])
-        frac = 1.0 - (step_count // minibatches_per_update) / max(config["NUM_UPDATES"], 1)
+        minibatches_per_update = int(config["NUM_MINIBATCHES"]) * int(
+            config["UPDATE_EPOCHS"]
+        )
+        frac = 1.0 - (step_count // minibatches_per_update) / max(
+            config["NUM_UPDATES"], 1
+        )
         return jnp.asarray(config["LR"], dtype=jnp.float32) * frac
 
     if config.get("ANNEAL_LR", False):
@@ -373,6 +385,17 @@ def make_train(
         total_completed_episodes = 0
         metrics_history: dict[str, list[float]] = defaultdict(list)
         episode_history: list[dict[str, object]] = []
+        cost_tracker = VectorEpisodicCostTracker(
+            num_envs=num_envs,
+            num_agents=num_agents,
+            gamma=float(config["COST_BUDGET_GAMMA"]),
+            initial_returns=float(config["COST_LIMIT"]),
+        )
+        raw_cost_tracker = VectorEpisodicCostTracker(
+            num_envs=num_envs,
+            num_agents=num_agents,
+            gamma=float(config["COST_BUDGET_GAMMA"]),
+        )
 
         try:
             rng, init_rng = jax.random.split(rng)
@@ -492,7 +515,9 @@ def make_train(
                     next_obs_for_value = np.zeros_like(last_obs)
                     reward_batch = np.zeros((num_envs, num_agents), dtype=np.float32)
                     raw_cost_batch = np.zeros((num_envs, num_agents), dtype=np.float32)
-                    terminated_batch = np.zeros((num_envs, num_agents), dtype=np.float32)
+                    terminated_batch = np.zeros(
+                        (num_envs, num_agents), dtype=np.float32
+                    )
                     episode_done_batch = np.zeros(
                         (num_envs, num_agents),
                         dtype=np.float32,
@@ -500,10 +525,7 @@ def make_train(
 
                     for env_idx, env in enumerate(envs):
                         env_global_step = (
-                            update_idx * batch_size
-                            + step_idx * num_envs
-                            + env_idx
-                            + 1
+                            update_idx * batch_size + step_idx * num_envs + env_idx + 1
                         )
                         action_dict = actions_array_to_dict(
                             actions_np[env_idx],
@@ -584,11 +606,13 @@ def make_train(
                         traj_shield_intervention_fractions[step_idx, env_idx] = (
                             shield_intervention_fraction
                         )
-                        latest_cumulative_safety_violations[env_idx] = shared_info_value(
-                            infos,
-                            env_spec.agent_ids,
-                            "safety_violations_cumulative",
-                            default=0.0,
+                        latest_cumulative_safety_violations[env_idx] = (
+                            shared_info_value(
+                                infos,
+                                env_spec.agent_ids,
+                                "safety_violations_cumulative",
+                                default=0.0,
+                            )
                         )
                         episode_returns[env_idx] += reward_array
                         episode_lengths[env_idx] += 1
@@ -707,7 +731,9 @@ def make_train(
                             predictor_batch,
                         )
                     )
-                    shaping_loss_by_agent = np.asarray(shaping_info["cost_shaping_loss"])
+                    shaping_loss_by_agent = np.asarray(
+                        shaping_info["cost_shaping_loss"]
+                    )
                 else:
                     delta_by_agent = np.zeros(
                         (num_agents, batch_size),
@@ -728,8 +754,7 @@ def make_train(
                     (1, 2, 0),
                 ).astype(np.float32)
                 traj_costs = (
-                    traj_raw_costs
-                    + float(config["COST_SHAPING_COEF"]) * cost_deltas
+                    traj_raw_costs + float(config["COST_SHAPING_COEF"]) * cost_deltas
                 ).astype(np.float32)
 
                 traj_batch = Transition(
@@ -768,9 +793,9 @@ def make_train(
                         traj_batch.reward_value,
                         (2, 0, 1),
                     ).reshape(num_agents, batch_size),
-                    "cost_value": jnp.transpose(traj_batch.cost_value, (2, 0, 1)).reshape(
-                        num_agents, batch_size
-                    ),
+                    "cost_value": jnp.transpose(
+                        traj_batch.cost_value, (2, 0, 1)
+                    ).reshape(num_agents, batch_size),
                     "reward_advantage": jnp.transpose(
                         reward_advantages,
                         (2, 0, 1),
@@ -786,20 +811,36 @@ def make_train(
                     ),
                 }
 
-                cost_returns = _discounted_agent_cost_returns(
+                (
+                    cost_returns,
+                    cost_return_scales,
+                    completed_cost_episodes,
+                ) = cost_tracker.add(
+                    traj_costs,
+                    traj_episode_dones,
+                )
+                raw_cost_returns, _, _ = raw_cost_tracker.add(
+                    traj_raw_costs,
+                    traj_episode_dones,
+                )
+                discounted_fragment_cost_returns = _discounted_agent_cost_returns(
                     traj_costs,
                     traj_episode_dones,
                     gamma=float(config["COST_GAMMA"]),
                 )
-                raw_cost_returns = _discounted_agent_cost_returns(
+                discounted_raw_fragment_cost_returns = _discounted_agent_cost_returns(
                     traj_raw_costs,
                     traj_episode_dones,
                     gamma=float(config["COST_GAMMA"]),
                 )
-                cost_return_scales = _discounted_agent_cost_return_scales(
-                    traj_costs,
-                    traj_episode_dones,
-                    gamma=float(config["COST_GAMMA"]),
+                (
+                    flat_batch["cost_advantage"],
+                    cost_return_scales,
+                ) = _prepare_cpo_cost_advantages(
+                    flat_batch["cost_advantage"],
+                    jnp.asarray(cost_return_scales, dtype=jnp.float32),
+                    center=bool(config["CENTER_COST_ADVANTAGES"]),
+                    normalize=bool(config["NORMALIZE_COST_ADVANTAGES"]),
                 )
                 next_actor_params, actor_metrics = _update_actors(
                     train_state.actor_params,
@@ -859,7 +900,9 @@ def make_train(
                 safety_violations_agent_fraction_mean = float(
                     traj_safety_violation_fractions.mean()
                 )
-                shield_interventions_mean = float(traj_shield_intervention_counts.mean())
+                shield_interventions_mean = float(
+                    traj_shield_intervention_counts.mean()
+                )
                 shield_interventions_agent_fraction_mean = float(
                     traj_shield_intervention_fractions.mean()
                 )
@@ -867,7 +910,9 @@ def make_train(
                     latest_cumulative_safety_violations.sum()
                 )
                 if completed_returns:
-                    mean_episode_return = np.stack(completed_returns, axis=0).mean(axis=0)
+                    mean_episode_return = np.stack(completed_returns, axis=0).mean(
+                        axis=0
+                    )
                     mean_episode_length = float(np.mean(completed_lengths))
                     mean_episode_safety_violations = float(
                         np.mean(completed_safety_violation_counts)
@@ -878,8 +923,7 @@ def make_train(
                     mean_episode_safety_violations = 0.0
 
                 actor_metrics_np = {
-                    key: np.asarray(value)
-                    for key, value in actor_metrics.items()
+                    key: np.asarray(value) for key, value in actor_metrics.items()
                 }
                 metrics = {
                     "update": float(update_idx),
@@ -890,14 +934,24 @@ def make_train(
                     "episode_return_mean": float(mean_episode_return.mean()),
                     "cost_mean": float(mean_agent_costs.mean()),
                     "cost_return_mean": float(cost_returns.mean()),
+                    "discounted_cost_return_mean": float(
+                        discounted_fragment_cost_returns.mean()
+                    ),
                     "raw_cost_mean": float(mean_agent_raw_costs.mean()),
                     "raw_cost_return_mean": float(raw_cost_returns.mean()),
+                    "discounted_raw_cost_return_mean": float(
+                        discounted_raw_fragment_cost_returns.mean()
+                    ),
                     "shaped_cost_mean": float(mean_agent_costs.mean()),
                     "shaped_cost_return_mean": float(cost_returns.mean()),
                     "cost_shaping_delta_mean": float(mean_agent_cost_deltas.mean()),
                     "cost_shaping_label_mean": float(mean_agent_cost_labels.mean()),
                     "cost_shaping_loss": float(shaping_loss_by_agent.mean()),
                     "constraint_violation_mean": float(constraint_violations.mean()),
+                    "cost_budget_fresh_fraction": float(
+                        (completed_cost_episodes > 0).mean()
+                    ),
+                    "completed_cost_episodes": float(completed_cost_episodes.mean()),
                     "safety_violations_mean": safety_violations_mean,
                     "safety_violations_agent_fraction_mean": (
                         safety_violations_agent_fraction_mean
@@ -942,11 +996,15 @@ def make_train(
                 ):
                     metrics[key] = float(actor_metrics_np[key].mean())
                 for agent_idx, agent_id in enumerate(env_spec.agent_ids):
-                    metrics[f"{agent_id}/reward_mean"] = float(step_reward_mean[agent_idx])
+                    metrics[f"{agent_id}/reward_mean"] = float(
+                        step_reward_mean[agent_idx]
+                    )
                     metrics[f"{agent_id}/episode_return"] = float(
                         mean_episode_return[agent_idx]
                     )
-                    metrics[f"{agent_id}/cost_mean"] = float(mean_agent_costs[agent_idx])
+                    metrics[f"{agent_id}/cost_mean"] = float(
+                        mean_agent_costs[agent_idx]
+                    )
                     metrics[f"{agent_id}/raw_cost_mean"] = float(
                         mean_agent_raw_costs[agent_idx]
                     )
@@ -956,6 +1014,9 @@ def make_train(
                     metrics[f"{agent_id}/raw_cost_return_mean"] = float(
                         raw_cost_returns[agent_idx]
                     )
+                    metrics[f"{agent_id}/discounted_raw_cost_return"] = float(
+                        discounted_raw_fragment_cost_returns[agent_idx]
+                    )
                     metrics[f"{agent_id}/shaped_cost_mean"] = float(
                         mean_agent_costs[agent_idx]
                     )
@@ -964,6 +1025,9 @@ def make_train(
                     )
                     metrics[f"{agent_id}/shaped_cost_return_mean"] = float(
                         cost_returns[agent_idx]
+                    )
+                    metrics[f"{agent_id}/discounted_cost_return"] = float(
+                        discounted_fragment_cost_returns[agent_idx]
                     )
                     metrics[f"{agent_id}/cost_shaping_delta_mean"] = float(
                         mean_agent_cost_deltas[agent_idx]
@@ -980,6 +1044,12 @@ def make_train(
                     )
                     metrics[f"{agent_id}/constraint_violation"] = float(
                         constraint_violations[agent_idx]
+                    )
+                    metrics[f"{agent_id}/cost_budget_fresh"] = float(
+                        completed_cost_episodes[agent_idx] > 0
+                    )
+                    metrics[f"{agent_id}/completed_cost_episodes"] = float(
+                        completed_cost_episodes[agent_idx]
                     )
                     for key, value in aggregated_critic_metrics.items():
                         metrics[f"{agent_id}/{key}"] = float(value[agent_idx])
@@ -1015,8 +1085,7 @@ def make_train(
                 "train_state": train_state,
                 "agent_ids": env_spec.agent_ids,
                 "metrics": {
-                    key: jnp.asarray(values)
-                    for key, values in metrics_history.items()
+                    key: jnp.asarray(values) for key, values in metrics_history.items()
                 },
                 "episode_history": episode_history,
             }
@@ -1025,6 +1094,19 @@ def make_train(
                 env.close()
 
     return train
+
+
+def make_cpo_train(
+    config: Mapping[str, Any],
+    env_factory: EnvFactory | str | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> Callable[[jax.Array], dict[str, Any]]:
+    """Build the plain CPO preset without ICPO cost shaping."""
+
+    cpo_config = dict(config)
+    cpo_config["COST_SHAPING_ENABLED"] = False
+    cpo_config.setdefault("COST_GAE_LAMBDA", 0.95)
+    return make_train(cpo_config, env_factory, progress_callback)
 
 
 def _sample_actions(
@@ -1123,6 +1205,29 @@ def _discounted_agent_cost_return_scales(
     return scales
 
 
+def _prepare_cpo_cost_advantages(
+    cost_advantages: jax.Array,
+    constraint_scales: jax.Array,
+    *,
+    center: bool = True,
+    normalize: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """Center cost advantages and preserve the constraint's physical units."""
+
+    if normalize:
+        standard_deviations = cost_advantages.std(axis=1, keepdims=True) + 1e-8
+        normalized = (
+            cost_advantages - cost_advantages.mean(axis=1, keepdims=True)
+        ) / standard_deviations
+        return normalized, constraint_scales / standard_deviations[:, 0]
+    if center:
+        cost_advantages = cost_advantages - cost_advantages.mean(
+            axis=1,
+            keepdims=True,
+        )
+    return cost_advantages, constraint_scales
+
+
 def _future_violation_labels(
     raw_costs: np.ndarray,
     episode_dones: np.ndarray,
@@ -1163,8 +1268,7 @@ def _predictor_binary_cross_entropy(
     eps = jnp.asarray(1e-6, dtype=probabilities.dtype)
     clipped = jnp.clip(probabilities, eps, 1.0 - eps)
     return -jnp.mean(
-        labels * jnp.log(clipped)
-        + (1.0 - labels) * jnp.log(1.0 - clipped)
+        labels * jnp.log(clipped) + (1.0 - labels) * jnp.log(1.0 - clipped)
     )
 
 
@@ -1310,7 +1414,8 @@ def _update_actors(
         agent_batch = {
             key: value[agent_idx]
             for key, value in flat_batch.items()
-            if key in {"obs", "action", "log_prob", "reward_advantage", "cost_advantage"}
+            if key
+            in {"obs", "action", "log_prob", "reward_advantage", "cost_advantage"}
         }
         next_agent_params, agent_metrics = update_actor_agent(
             agent_params,
@@ -1350,7 +1455,7 @@ def _actor_surrogates(
     reward_objective = (ratio * _normalized_advantage(reward_advantage)).mean()
     cost_objective = (ratio * cost_advantage).mean()
     old_pi = distrax.Categorical(logits=old_logits)
-    mean_kl = pi.kl_divergence(old_pi).mean()
+    mean_kl = old_pi.kl_divergence(pi).mean()
     entropy = pi.entropy().mean()
     return reward_objective, cost_objective, mean_kl, entropy
 
@@ -1549,9 +1654,8 @@ def _line_search_actor(
         reward_improve = reward_objective - old_reward_objective
         cost_diff = cost_objective - old_cost_objective
         reward_ok = jnp.logical_or(optim_case <= 1.0, reward_improve >= -1e-10)
-        is_recovery = optim_case == 0.0
         cost_ok = jnp.where(
-            is_recovery,
+            constraint_violation > 0.0,
             cost_diff < -1e-10,
             constraint_violation + cost_diff <= 1e-10,
         )
@@ -1574,14 +1678,17 @@ def _line_search_actor(
         ), None
 
     (
-        accepted,
-        best_flat,
-        best_fraction,
-        best_kl,
-        best_reward_improve,
-        best_cost_diff,
-        reject_count,
-    ), _ = jax.lax.scan(
+        (
+            accepted,
+            best_flat,
+            best_fraction,
+            best_kl,
+            best_reward_improve,
+            best_cost_diff,
+            reject_count,
+        ),
+        _,
+    ) = jax.lax.scan(
         _body,
         initial_carry,
         jnp.arange(int(line_search_steps)),
@@ -1653,7 +1760,7 @@ def _update_actor_agent(
         logits = actor.apply(current_params, fvp_obs)
         old_pi = distrax.Categorical(logits=fvp_old_logits)
         current_pi = distrax.Categorical(logits=logits)
-        return current_pi.kl_divergence(old_pi).mean()
+        return old_pi.kl_divergence(current_pi).mean()
 
     grad_kl_flat = jax.grad(_kl_flat)
 
@@ -1711,7 +1818,9 @@ def _update_actor_agent(
         "cpo_constraint_scale": cost_return_scale.astype(jnp.float32),
         "cpo_scaled_constraint_violation": constraint_violation.astype(jnp.float32),
         "cpo_step_norm": jnp.linalg.norm(flat_step).astype(jnp.float32),
-        "cpo_reward_gradient_norm": jnp.linalg.norm(flat_reward_grad).astype(jnp.float32),
+        "cpo_reward_gradient_norm": jnp.linalg.norm(flat_reward_grad).astype(
+            jnp.float32
+        ),
         "cpo_cost_gradient_norm": jnp.linalg.norm(flat_cost_grad).astype(jnp.float32),
         "cpo_reward_cg_residual_norm": reward_cg_residual.astype(jnp.float32),
         "cpo_cost_cg_residual_norm": cost_cg_residual.astype(jnp.float32),

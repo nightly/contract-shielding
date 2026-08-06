@@ -12,11 +12,11 @@ import optax
 from flax.linen.initializers import constant, orthogonal
 
 from .trajectory import (
+    VectorEpisodicCostTracker,
     clipped_value_loss,
     compute_gae,
     discounted_cost_returns_at_starts,
     episode_history_entry,
-    normalize_advantage,
     ppo_approx_kl,
 )
 from .ippo import (
@@ -158,16 +158,36 @@ def make_train(
     config.setdefault("LAMBDA_MAX", 1e6)
     config.setdefault("COST_GAMMA", config["GAMMA"])
     config.setdefault("COST_GAE_LAMBDA", config["GAE_LAMBDA"])
+    config.setdefault("COST_BUDGET_GAMMA", 1.0)
     config.setdefault("COST_VF_COEF", config["VF_COEF"])
+    config.setdefault("STANDARDIZE_REWARD_ADVANTAGES", True)
+    config.setdefault("CENTER_COST_ADVANTAGES", True)
     config.setdefault("NORMALIZE_COST_ADVANTAGES", False)
     config.setdefault("COST_INFO_KEY", "safety_violation")
     config.setdefault("CLIP_VALUE_LOSS", True)
     config.setdefault("VALUE_CLIP_EPS", config["CLIP_EPS"])
     config["NUM_UPDATES"] = (
-        int(config["TOTAL_TIMESTEPS"]) // int(config["NUM_STEPS"]) // int(config["NUM_ENVS"])
+        int(config["TOTAL_TIMESTEPS"])
+        // int(config["NUM_STEPS"])
+        // int(config["NUM_ENVS"])
     )
     config["MINIBATCH_SIZE"] = (
-        int(config["NUM_STEPS"]) * int(config["NUM_ENVS"]) // int(config["NUM_MINIBATCHES"])
+        int(config["NUM_STEPS"])
+        * int(config["NUM_ENVS"])
+        // int(config["NUM_MINIBATCHES"])
+    )
+    if float(config["LAMBDA_MIN"]) < 0.0:
+        raise ValueError("LAMBDA_MIN must be nonnegative.")
+    if float(config["LAMBDA_MAX"]) < float(config["LAMBDA_MIN"]):
+        raise ValueError("LAMBDA_MAX must be greater than or equal to LAMBDA_MIN.")
+    if float(config["LAMBDA_LR"]) < 0.0:
+        raise ValueError("LAMBDA_LR must be nonnegative.")
+    config["LAMBDA_INIT"] = float(
+        np.clip(
+            float(config["LAMBDA_INIT"]),
+            float(config["LAMBDA_MIN"]),
+            float(config["LAMBDA_MAX"]),
+        )
     )
 
     factory_ref = env_factory or config.get("ENV_FACTORY") or config.get("ENV_NAME")
@@ -190,8 +210,12 @@ def make_train(
     )
 
     def linear_schedule(step_count: jax.Array) -> jax.Array:
-        minibatches_per_update = int(config["NUM_MINIBATCHES"]) * int(config["UPDATE_EPOCHS"])
-        frac = 1.0 - (step_count // minibatches_per_update) / max(config["NUM_UPDATES"], 1)
+        minibatches_per_update = int(config["NUM_MINIBATCHES"]) * int(
+            config["UPDATE_EPOCHS"]
+        )
+        frac = 1.0 - (step_count // minibatches_per_update) / max(
+            config["NUM_UPDATES"], 1
+        )
         return jnp.asarray(config["LR"], dtype=jnp.float32) * frac
 
     if config.get("ANNEAL_LR", False):
@@ -224,7 +248,9 @@ def make_train(
         )
     )
     update_minibatch_jit = jax.jit(
-        lambda state, minibatch: _update_minibatch(config, network, tx, state, minibatch)
+        lambda state, minibatch: _update_minibatch(
+            config, network, tx, state, minibatch
+        )
     )
 
     def train(rng: jax.Array) -> dict[str, Any]:
@@ -248,6 +274,12 @@ def make_train(
         total_completed_episodes = 0
         metrics_history: dict[str, list[float]] = defaultdict(list)
         episode_history: list[dict[str, object]] = []
+        cost_tracker = VectorEpisodicCostTracker(
+            num_envs=num_envs,
+            num_agents=num_agents,
+            gamma=float(config["COST_BUDGET_GAMMA"]),
+            initial_returns=float(config["COST_LIMIT"]),
+        )
 
         try:
             rng, init_rng = jax.random.split(rng)
@@ -359,7 +391,9 @@ def make_train(
                     next_obs_for_value = np.zeros_like(last_obs)
                     reward_batch = np.zeros((num_envs, num_agents), dtype=np.float32)
                     cost_batch = np.zeros((num_envs, num_agents), dtype=np.float32)
-                    terminated_batch = np.zeros((num_envs, num_agents), dtype=np.float32)
+                    terminated_batch = np.zeros(
+                        (num_envs, num_agents), dtype=np.float32
+                    )
                     episode_done_batch = np.zeros(
                         (num_envs, num_agents),
                         dtype=np.float32,
@@ -367,10 +401,7 @@ def make_train(
 
                     for env_idx, env in enumerate(envs):
                         env_global_step = (
-                            update_idx * batch_size
-                            + step_idx * num_envs
-                            + env_idx
-                            + 1
+                            update_idx * batch_size + step_idx * num_envs + env_idx + 1
                         )
                         action_dict = actions_array_to_dict(
                             actions_np[env_idx],
@@ -451,11 +482,13 @@ def make_train(
                         traj_shield_intervention_fractions[step_idx, env_idx] = (
                             shield_intervention_fraction
                         )
-                        latest_cumulative_safety_violations[env_idx] = shared_info_value(
-                            infos,
-                            env_spec.agent_ids,
-                            "safety_violations_cumulative",
-                            default=0.0,
+                        latest_cumulative_safety_violations[env_idx] = (
+                            shared_info_value(
+                                infos,
+                                env_spec.agent_ids,
+                                "safety_violations_cumulative",
+                                default=0.0,
+                            )
                         )
                         episode_returns[env_idx] += reward_array
                         episode_lengths[env_idx] += 1
@@ -557,9 +590,9 @@ def make_train(
                         traj_batch.reward_value,
                         (2, 0, 1),
                     ).reshape(num_agents, batch_size),
-                    "cost_value": jnp.transpose(traj_batch.cost_value, (2, 0, 1)).reshape(
-                        num_agents, batch_size
-                    ),
+                    "cost_value": jnp.transpose(
+                        traj_batch.cost_value, (2, 0, 1)
+                    ).reshape(num_agents, batch_size),
                     "reward_advantage": jnp.transpose(
                         reward_advantages,
                         (2, 0, 1),
@@ -574,6 +607,51 @@ def make_train(
                         num_agents, batch_size
                     ),
                 }
+
+                (
+                    mean_agent_cost_returns,
+                    _,
+                    completed_cost_episodes,
+                ) = cost_tracker.add(traj_costs, traj_episode_dones)
+                discounted_fragment_cost_returns = (
+                    _mean_discounted_cost_returns_at_starts(
+                        traj_costs,
+                        traj_episode_dones,
+                        gamma=float(config["COST_GAMMA"]),
+                    )
+                )
+                previous_lagrangian_multipliers = np.asarray(
+                    train_state.lagrangian_multipliers
+                )
+                proposed_lagrangian_multipliers = np.clip(
+                    previous_lagrangian_multipliers
+                    + float(config["LAMBDA_LR"])
+                    * (mean_agent_cost_returns - float(config["COST_LIMIT"])),
+                    float(config["LAMBDA_MIN"]),
+                    float(config["LAMBDA_MAX"]),
+                )
+                dual_update_mask = completed_cost_episodes > 0
+                lagrangian_multipliers_for_update = np.where(
+                    dual_update_mask,
+                    proposed_lagrangian_multipliers,
+                    previous_lagrangian_multipliers,
+                ).astype(np.float32)
+                train_state = MultiAgentLagrangianTrainState(
+                    params=train_state.params,
+                    opt_state=train_state.opt_state,
+                    lagrangian_multipliers=jnp.asarray(
+                        lagrangian_multipliers_for_update,
+                        dtype=jnp.float32,
+                    ),
+                )
+                flat_batch["actor_advantage"] = _prepare_lagrangian_advantages(
+                    flat_batch["reward_advantage"],
+                    flat_batch["cost_advantage"],
+                    train_state.lagrangian_multipliers,
+                    standardize_reward=bool(config["STANDARDIZE_REWARD_ADVANTAGES"]),
+                    center_cost=bool(config["CENTER_COST_ADVANTAGES"]),
+                    normalize_cost=bool(config["NORMALIZE_COST_ADVANTAGES"]),
+                )
 
                 minibatch_metrics: list[dict[str, np.ndarray]] = []
                 for _ in range(int(config["UPDATE_EPOCHS"])):
@@ -600,26 +678,6 @@ def make_train(
                         )
 
                 mean_agent_cost_rates = traj_costs.mean(axis=(0, 1))
-                mean_agent_cost_returns = _mean_discounted_cost_returns_at_starts(
-                    traj_costs,
-                    traj_episode_dones,
-                    gamma=float(config["COST_GAMMA"]),
-                )
-                next_lagrangian_multipliers = jnp.clip(
-                    train_state.lagrangian_multipliers
-                    + jnp.asarray(config["LAMBDA_LR"], dtype=jnp.float32)
-                    * (
-                        jnp.asarray(mean_agent_cost_returns, dtype=jnp.float32)
-                        - jnp.asarray(config["COST_LIMIT"], dtype=jnp.float32)
-                    ),
-                    jnp.asarray(config["LAMBDA_MIN"], dtype=jnp.float32),
-                    jnp.asarray(config["LAMBDA_MAX"], dtype=jnp.float32),
-                )
-                train_state = MultiAgentLagrangianTrainState(
-                    params=train_state.params,
-                    opt_state=train_state.opt_state,
-                    lagrangian_multipliers=next_lagrangian_multipliers,
-                )
 
                 aggregated_loss_metrics: dict[str, np.ndarray] = {}
                 for key in minibatch_metrics[0]:
@@ -633,7 +691,9 @@ def make_train(
                 safety_violations_agent_fraction_mean = float(
                     traj_safety_violation_fractions.mean()
                 )
-                shield_interventions_mean = float(traj_shield_intervention_counts.mean())
+                shield_interventions_mean = float(
+                    traj_shield_intervention_counts.mean()
+                )
                 shield_interventions_agent_fraction_mean = float(
                     traj_shield_intervention_fractions.mean()
                 )
@@ -641,7 +701,9 @@ def make_train(
                     latest_cumulative_safety_violations.sum()
                 )
                 if completed_returns:
-                    mean_episode_return = np.stack(completed_returns, axis=0).mean(axis=0)
+                    mean_episode_return = np.stack(completed_returns, axis=0).mean(
+                        axis=0
+                    )
                     mean_episode_length = float(np.mean(completed_lengths))
                     mean_episode_safety_violations = float(
                         np.mean(completed_safety_violation_counts)
@@ -652,6 +714,9 @@ def make_train(
                     mean_episode_safety_violations = 0.0
 
                 lagrangian_multipliers = np.asarray(train_state.lagrangian_multipliers)
+                constraint_violations = mean_agent_cost_returns - float(
+                    config["COST_LIMIT"]
+                )
                 metrics = {
                     "update": float(update_idx),
                     "global_step": float((update_idx + 1) * batch_size),
@@ -661,8 +726,18 @@ def make_train(
                     "episode_return_mean": float(mean_episode_return.mean()),
                     "cost_mean": float(mean_agent_cost_returns.mean()),
                     "cost_return_mean": float(mean_agent_cost_returns.mean()),
+                    "discounted_cost_return_mean": float(
+                        discounted_fragment_cost_returns.mean()
+                    ),
                     "cost_rate_mean": float(mean_agent_cost_rates.mean()),
+                    "constraint_violation_mean": float(constraint_violations.mean()),
                     "lagrangian_multiplier_mean": float(lagrangian_multipliers.mean()),
+                    "lagrangian_multiplier_used_mean": float(
+                        lagrangian_multipliers_for_update.mean()
+                    ),
+                    "cost_budget_fresh_fraction": float(dual_update_mask.mean()),
+                    "dual_update_applied_fraction": float(dual_update_mask.mean()),
+                    "completed_cost_episodes": float(completed_cost_episodes.mean()),
                     "safety_violations_mean": safety_violations_mean,
                     "safety_violations_agent_fraction_mean": (
                         safety_violations_agent_fraction_mean
@@ -678,7 +753,9 @@ def make_train(
                 for key, value in aggregated_loss_metrics.items():
                     metrics[key] = float(value.mean())
                 for agent_idx, agent_id in enumerate(env_spec.agent_ids):
-                    metrics[f"{agent_id}/reward_mean"] = float(step_reward_mean[agent_idx])
+                    metrics[f"{agent_id}/reward_mean"] = float(
+                        step_reward_mean[agent_idx]
+                    )
                     metrics[f"{agent_id}/episode_return"] = float(
                         mean_episode_return[agent_idx]
                     )
@@ -688,11 +765,29 @@ def make_train(
                     metrics[f"{agent_id}/cost_return_mean"] = float(
                         mean_agent_cost_returns[agent_idx]
                     )
+                    metrics[f"{agent_id}/discounted_cost_return"] = float(
+                        discounted_fragment_cost_returns[agent_idx]
+                    )
                     metrics[f"{agent_id}/cost_rate_mean"] = float(
                         mean_agent_cost_rates[agent_idx]
                     )
+                    metrics[f"{agent_id}/constraint_violation"] = float(
+                        constraint_violations[agent_idx]
+                    )
                     metrics[f"{agent_id}/lagrangian_multiplier"] = float(
                         lagrangian_multipliers[agent_idx]
+                    )
+                    metrics[f"{agent_id}/lagrangian_multiplier_used"] = float(
+                        lagrangian_multipliers_for_update[agent_idx]
+                    )
+                    metrics[f"{agent_id}/cost_budget_fresh"] = float(
+                        dual_update_mask[agent_idx]
+                    )
+                    metrics[f"{agent_id}/dual_update_applied"] = float(
+                        dual_update_mask[agent_idx]
+                    )
+                    metrics[f"{agent_id}/completed_cost_episodes"] = float(
+                        completed_cost_episodes[agent_idx]
                     )
                     for key, value in aggregated_loss_metrics.items():
                         metrics[f"{agent_id}/{key}"] = float(value[agent_idx])
@@ -726,8 +821,7 @@ def make_train(
                 "train_state": train_state,
                 "agent_ids": env_spec.agent_ids,
                 "metrics": {
-                    key: jnp.asarray(values)
-                    for key, values in metrics_history.items()
+                    key: jnp.asarray(values) for key, values in metrics_history.items()
                 },
                 "episode_history": episode_history,
             }
@@ -807,6 +901,38 @@ def _compute_advantages(
     return reward_advantages, reward_targets, cost_advantages, cost_targets
 
 
+def _prepare_lagrangian_advantages(
+    reward_advantage: jax.Array,
+    cost_advantage: jax.Array,
+    lagrangian_multipliers: jax.Array,
+    *,
+    standardize_reward: bool = True,
+    center_cost: bool = True,
+    normalize_cost: bool = False,
+) -> jax.Array:
+    """Prepare the full-rollout primal-dual advantage for PPO minibatches."""
+
+    reward_for_actor = reward_advantage
+    if standardize_reward:
+        reward_for_actor = (
+            reward_for_actor - reward_for_actor.mean(axis=1, keepdims=True)
+        ) / (reward_for_actor.std(axis=1, keepdims=True) + 1e-8)
+
+    cost_for_actor = cost_advantage
+    if normalize_cost:
+        cost_for_actor = (
+            cost_for_actor - cost_for_actor.mean(axis=1, keepdims=True)
+        ) / (cost_for_actor.std(axis=1, keepdims=True) + 1e-8)
+    elif center_cost:
+        cost_for_actor = cost_for_actor - cost_for_actor.mean(
+            axis=1,
+            keepdims=True,
+        )
+
+    multipliers = lagrangian_multipliers[:, None]
+    return (reward_for_actor - multipliers * cost_for_actor) / (1.0 + multipliers)
+
+
 def _update_minibatch(
     config: Mapping[str, Any],
     network: ActorCriticLagrangian,
@@ -823,14 +949,12 @@ def _update_minibatch(
 
     def _loss_fn(
         params: Any,
-        lagrangian_multiplier: jax.Array,
         obs: jax.Array,
         action: jax.Array,
         old_log_prob: jax.Array,
         old_reward_value: jax.Array,
         old_cost_value: jax.Array,
-        reward_advantage: jax.Array,
-        cost_advantage: jax.Array,
+        actor_advantage: jax.Array,
         reward_target: jax.Array,
         cost_target: jax.Array,
     ) -> tuple[jax.Array, dict[str, jax.Array]]:
@@ -854,19 +978,10 @@ def _update_minibatch(
             clip_value_loss=clip_value_loss,
         )
 
-        normalized_reward_advantage = normalize_advantage(reward_advantage)
-        if bool(config.get("NORMALIZE_COST_ADVANTAGES", False)):
-            cost_advantage_for_loss = normalize_advantage(cost_advantage)
-        else:
-            cost_advantage_for_loss = cost_advantage
-        lagrangian_advantage = (
-            normalized_reward_advantage
-            - lagrangian_multiplier * cost_advantage_for_loss
-        )
         log_ratio = log_prob - old_log_prob
         ratio = jnp.exp(log_ratio)
-        unclipped = ratio * lagrangian_advantage
-        clipped = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * lagrangian_advantage
+        unclipped = ratio * actor_advantage
+        clipped = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * actor_advantage
         actor_loss = -jnp.minimum(unclipped, clipped).mean()
         entropy = pi.entropy().mean()
         total_loss = (
@@ -891,18 +1006,16 @@ def _update_minibatch(
 
     grad_fn = jax.vmap(
         jax.value_and_grad(_loss_fn, has_aux=True),
-        in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0),
     )
     (losses, loss_info), grads = grad_fn(
         train_state.params,
-        train_state.lagrangian_multipliers,
         minibatch["obs"],
         minibatch["action"],
         minibatch["log_prob"],
         minibatch["reward_value"],
         minibatch["cost_value"],
-        minibatch["reward_advantage"],
-        minibatch["cost_advantage"],
+        minibatch["actor_advantage"],
         minibatch["reward_target"],
         minibatch["cost_target"],
     )
@@ -914,10 +1027,7 @@ def _update_minibatch(
     )
     next_params = jax.vmap(optax.apply_updates)(train_state.params, updates)
 
-    metrics = {
-        key: value
-        for key, value in loss_info.items()
-    }
+    metrics = {key: value for key, value in loss_info.items()}
     metrics["total_loss"] = losses
 
     return (
