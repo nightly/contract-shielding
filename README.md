@@ -7,10 +7,13 @@
 |-- README.md
 `-- src
     |-- shield
-    |   |-- automaton.py      # Automata utilities used by the shielding layer.
-    |   |-- contracts.py      # Contract definitions and helpers.
-    |   |-- core.py           # Core shielding logic.
-    |   `-- wrapper.py        # Environment wrapper for applying shields.
+    |   |-- _assume_guarantee.py   # Assume-guarantee product construction and shield synthesis.
+    |   |-- _contract_candidates.py  # Local-obligation candidate generation and pruning.
+    |   |-- _contract_types.py     # Contract data models, configs, helpers, and bandit selection.
+    |   |-- automaton.py           # Automata utilities used by the shielding layer.
+    |   |-- contracts.py           # Public contract API and contract-library orchestration.
+    |   |-- core.py                # Core shielding logic.
+    |   `-- wrapper.py             # Environment wrapper for applying shields.
     |-- rl
     |   |-- icpo.py
     |   |-- ippo.py
@@ -22,7 +25,7 @@
     |   |-- joint_ppo.py
     |   |-- mappo.py
     |   |-- pqn_vdn.py
-    |   `-- trajectory.py     # Shared trajectory data structures.
+    |   `-- trajectory.py          # Shared trajectory data structures.
     `-- environments
         |-- car_platoon
         |-- connector
